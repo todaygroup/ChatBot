@@ -79,7 +79,6 @@ with st.sidebar:
     max_tokens = st.slider("Max Output Tokens", 128, 4096, 800, 50)
 
     st.subheader("🔊 음성(TTS) 설정")
-    # Web Speech API용 파라미터
     kr_rate = st.slider("한국어 속도 (rate)", 0.5, 1.5, 1.0, 0.05)
     kr_pitch = st.slider("한국어 피치 (pitch)", 0.5, 2.0, 1.0, 0.05)
     kr_volume = st.slider("한국어 볼륨 (volume)", 0.0, 1.0, 1.0, 0.05)
@@ -127,41 +126,65 @@ You MUST answer in the following format:
         kr = full.strip()  # 포맷 어긋나면 전체를 KR로
     return {"kr": kr, "en": en}
 
-# -------------------- 공통: Web Speech API 버튼 렌더러 --------------------
-#   - Streamlit 컴포넌트로 HTML/JS 삽입하여 브라우저에서 합성
-#   - lang: 'ko-KR' 또는 'en-US'
-def tts_button(label: str, text: str, lang: str, rate: float, pitch: float, volume: float, key: str):
-    import streamlit.components.v1 as components
-    safe_text = json.dumps(text)  # 안전한 JS 문자열로 인코딩
-    btn_id = f"btn_{key}"
-    html_code = f"""
-<div style="display:inline-block;margin:4px 0 8px 0;">
-  <button id="{btn_id}" style="cursor:pointer;border-radius:8px;padding:6px 10px;border:1px solid #444;background:#1f2937;color:#e5e7eb;">
-    🔊 {html.escape(label)}
-  </button>
-</div>
+# -------------------- 공통: Web Speech API 버튼 --------------------
+import streamlit.components.v1 as components
+
+def tts_button_html(text: str, lang: str, btn_id: str):
+    """단일 TTS 버튼(아이콘+라벨) HTML/JS 반환."""
+    safe_text = json.dumps(text)
+    return f"""
+<button id="{btn_id}" style="width:100%;cursor:pointer;border-radius:8px;padding:6px 10px;border:1px solid #444;background:#1f2937;color:#e5e7eb;">
+  🔊 { 'Play (KR)' if lang=='ko-KR' else 'Play (EN)' }
+</button>
 <script>
-  (function(){{
-    const btn = document.getElementById("{btn_id}");
-    if(!btn) return;
-    btn.addEventListener("click", function(){{
-      try {{
-        const utter = new SpeechSynthesisUtterance({safe_text});
-        utter.lang = "{lang}";
-        utter.rate = {rate};
-        utter.pitch = {pitch};
-        utter.volume = {volume};
-        window.speechSynthesis.cancel();  // 현재 재생 중이면 중단
-        window.speechSynthesis.speak(utter);
-      }} catch(e) {{
-        console.error(e);
-        alert("이 브라우저에서는 음성 합성이 지원되지 않을 수 있습니다.");
-      }}
-    }});
-  }})();
+(function(){{
+  const btn = document.getElementById("{btn_id}");
+  if(!btn) return;
+  btn.addEventListener("click", function(){{
+    try {{
+      const utter = new SpeechSynthesisUtterance({safe_text});
+      utter.lang = "{lang}";
+      // rate/pitch/volume는 전역변수에서 읽도록 커스텀 이벤트로 전달
+      const cfg = window.__ST_TTS_CFG__ || {{}};
+      utter.rate = cfg["{lang}"]?.rate ?? 1.0;
+      utter.pitch = cfg["{lang}"]?.pitch ?? 1.0;
+      utter.volume = cfg["{lang}"]?.volume ?? 1.0;
+      window.speechSynthesis.cancel();
+      window.speechSynthesis.speak(utter);
+    }} catch(e) {{
+      console.error(e);
+      alert("브라우저에서 음성 합성을 지원하지 않을 수 있습니다.");
+    }}
+  }});
+}})();
 </script>
 """
-    components.html(html_code, height=40)
+
+def push_tts_config(kr_rate, kr_pitch, kr_volume, en_rate, en_pitch, en_volume):
+    """현재 슬라이더 값을 브라우저 전역(window.__ST_TTS_CFG__)에 주입."""
+    cfg = {
+        "ko-KR": {"rate": kr_rate, "pitch": kr_pitch, "volume": kr_volume},
+        "en-US": {"rate": en_rate, "pitch": en_pitch, "volume": en_volume},
+    }
+    components.html(
+        f"""
+<script>
+window.__ST_TTS_CFG__ = {json.dumps(cfg)};
+</script>
+""",
+        height=0,
+    )
+
+def tts_row(text: str, key_prefix: str):
+    """두 개 버튼을 2열 한 줄로 렌더링."""
+    c1, c2 = st.columns(2)
+    with c1:
+        components.html(tts_button_html(text, "ko-KR", f"{key_prefix}_kr"), height=48)
+    with c2:
+        components.html(tts_button_html(text, "en-US", f"{key_prefix}_en"), height=48)
+
+# 슬라이더 값을 JS 전역으로 1회 주입(페이지 리렌더마다 최신 반영)
+push_tts_config(kr_rate, kr_pitch, kr_volume, en_rate, en_pitch, en_volume)
 
 # -------------------- 1) 대화 기록 먼저 렌더링 --------------------
 st.divider()
@@ -169,23 +192,21 @@ st.markdown("### 📜 대화 기록")
 for idx, msg in enumerate(st.session_state.history):
     with st.chat_message(msg["role"]):
         st.write(msg["content"])
-        # 각 메시지에도 음성 버튼 제공: 역할에 따라 언어 추정(간단 규칙)
-        # 한국어/영어 자동판별은 과할 수 있으니, 기본: user=입력 언어 미정 → KR 버튼/EN 버튼 둘 다 제공
-        tts_button("Play (KR)", msg["content"], "ko-KR", kr_rate, kr_pitch, kr_volume, key=f"hist_kr_{idx}")
-        tts_button("Play (EN)", msg["content"], "en-US", en_rate, en_pitch, en_volume, key=f"hist_en_{idx}")
+        # 한 줄(2열) TTS 버튼
+        tts_row(msg["content"], key_prefix=f"hist_{idx}")
 
 # -------------------- 2) 후보(두 답변) 섹션: 대화 기록 '아래'에 고정 --------------------
 cands = st.session_state.candidates
 if cands:
     st.divider()
     st.subheader("🧠 생성된 두 개의 답변")
-    col1, col2 = st.columns(2)
 
-    with col1:
-        st.markdown("### 🇰🇷 KR Korean Answer [KR]")
+    # KR 카드
+    with st.container():
+        st.markdown("#### 🇰🇷 KR Korean Answer [KR]")
         st.write(cands.get("kr") or "_(생성 결과가 비었습니다)_")
-        # 한국어 음성 버튼
-        tts_button("한국어로 듣기", cands.get("kr", ""), "ko-KR", kr_rate, kr_pitch, kr_volume, key="cand_kr")
+        # 답변 텍스트에 대한 TTS (2열, 한 줄)
+        tts_row(cands.get("kr", ""), key_prefix="cand_kr")
         if st.button("✅ 한국어 답변 선택", key="pick_kr"):
             chosen = cands.get("kr", "")
             if chosen:
@@ -193,11 +214,12 @@ if cands:
             st.session_state.candidates = None
             st.rerun()
 
-    with col2:
-        st.markdown("### 🇺🇸 US English Answer [EN]")
+    # EN 카드
+    with st.container():
+        st.markdown("#### 🇺🇸 US English Answer [EN]")
         st.write(cands.get("en") or "_(생성 결과가 비었습니다)_")
-        # 영어 음성 버튼
-        tts_button("Listen in English", cands.get("en", ""), "en-US", en_rate, en_pitch, en_volume, key="cand_en")
+        # 답변 텍스트에 대한 TTS (2열, 한 줄)
+        tts_row(cands.get("en", ""), key_prefix="cand_en")
         if st.button("✅ English Answer Select", key="pick_en"):
             chosen = cands.get("en", "")
             if chosen:
