@@ -11,7 +11,6 @@ try:
 except Exception:
     HTTPStatusError = ConnectError = ReadTimeout = Exception
 
-# -------------------- 페이지/초기 설정 --------------------
 st.set_page_config(page_title="Chatbot (KR & EN Two Answers) + TTS", page_icon="💬")
 
 st.title("💬 Chatbot (KR & EN Two Answers) + 🔊 TTS")
@@ -22,14 +21,19 @@ st.write(
 )
 
 # -------------------- 세션 상태 --------------------
-if "history" not in st.session_state:
-    st.session_state.history = []         # [{"role": "user|assistant", "content": str}, ...]
-if "candidates" not in st.session_state:
-    st.session_state.candidates = None    # {"kr": str, "en": str}
-if "last_candidate_idx" not in st.session_state:
-    st.session_state.last_candidate_idx = None  # 마지막으로 기록한 후보 답변(히스토리 인덱스)
+ss = st.session_state
+if "history" not in ss:
+    ss.history = []                # [{"role": "user|assistant", "content": str}, ...]
+if "candidates" not in ss:
+    ss.candidates = {}             # {"kr": str, "en": str}
+if "pending_selection" not in ss:
+    ss.pending_selection = False   # 후보 선택 대기 상태
+if "last_candidate_idx" not in ss:
+    ss.last_candidate_idx = None   # 히스토리에 반영된 후보(기본 KR)의 인덱스
+if "preflight_ok" not in ss:
+    ss.preflight_ok = False        # 사전 인증 1회만
 
-# -------------------- API 키 로딩 --------------------
+# -------------------- API 키 --------------------
 secret_key = st.secrets.get("OPENAI_API_KEY", "")
 env_key = os.environ.get("OPENAI_API_KEY", "")
 typed_key = st.text_input(
@@ -47,10 +51,12 @@ if not openai_api_key:
 if not (openai_api_key.startswith("sk-") or openai_api_key.startswith("sk-proj-")):
     st.warning("API 키는 보통 `sk-` 또는 `sk-proj-`로 시작합니다. 값을 다시 확인해 주세요.")
 
-# -------------------- OpenAI 클라이언트 + 사전 인증 --------------------
+# -------------------- OpenAI 클라이언트 + 사전 인증(1회) --------------------
 try:
     client = OpenAI(api_key=openai_api_key)
-    _ = client.models.list()  # 사전 헬스체크
+    if not ss.preflight_ok:
+        _ = client.models.list()   # 최초 1회만
+        ss.preflight_ok = True
 except HTTPStatusError as e:
     code = getattr(e.response, "status_code", None)
     text = getattr(e.response, "text", "")[:500]
@@ -88,10 +94,19 @@ with st.sidebar:
     en_pitch  = st.slider("영어 피치 (pitch)", 0.5, 2.0, 1.0, 0.05)
     en_volume = st.slider("영어 볼륨 (volume)", 0.0, 1.0, 1.0, 0.05)
 
+    with st.expander("🔧 디버그(상태 확인)", expanded=False):
+        st.write({
+            "pending_selection": ss.pending_selection,
+            "has_candidates": bool(ss.candidates),
+            "last_candidate_idx": ss.last_candidate_idx,
+            "history_len": len(ss.history),
+        })
+
     if st.button("🧹 초기화(히스토리/후보 삭제)"):
-        st.session_state.history.clear()
-        st.session_state.candidates = None
-        st.session_state.last_candidate_idx = None
+        ss.history.clear()
+        ss.candidates = {}
+        ss.pending_selection = False
+        ss.last_candidate_idx = None
         st.success("초기화 완료!")
         st.rerun()
 
@@ -118,18 +133,20 @@ You MUST answer in the following format:
             {"role": "user", "content": prompt},
         ],
     )
-    full = resp.choices[0].message.content
+    full = resp.choices[0].message.content or ""
 
-    # 간단 파싱
+    # 간단 파싱 (태그 누락 대비)
     kr, en = "", ""
     if "[KR]" in full and "[EN]" in full:
         kr = full.split("[KR]")[1].split("[EN]")[0].strip()
         en = full.split("[EN]")[1].strip()
     else:
-        kr = full.strip()  # 포맷 어긋나면 전체를 KR로
+        # 태그가 없을 때는 KR만 채움
+        kr = full.strip()
+        en = ""
     return {"kr": kr, "en": en}
 
-# -------------------- 공통: Web Speech API 버튼(2열 한 줄) --------------------
+# -------------------- 공통: Web Speech API(TTS) --------------------
 import streamlit.components.v1 as components
 
 def push_tts_config(kr_rate, kr_pitch, kr_volume, en_rate, en_pitch, en_volume):
@@ -140,7 +157,7 @@ def push_tts_config(kr_rate, kr_pitch, kr_volume, en_rate, en_pitch, en_volume):
     components.html(f"<script>window.__ST_TTS_CFG__ = {json.dumps(cfg)};</script>", height=0)
 
 def tts_button_html(text: str, lang: str, btn_id: str, label: str):
-    safe_text = json.dumps(text)
+    safe_text = json.dumps(text or "")
     return f"""
 <button id="{btn_id}" style="width:100%;cursor:pointer;border-radius:8px;padding:6px 10px;border:1px solid #444;background:#1f2937;color:#e5e7eb;">
   🔊 {html.escape(label)}
@@ -178,20 +195,20 @@ def tts_row(text: str, key_prefix: str):
     with c2:
         components.html(tts_button_html(text, "en-US", f"{key_prefix}_en", "Play (EN)"), height=48)
 
-# 매 렌더마다 최신 TTS 설정 반영
+# 최신 TTS 설정 주입
 push_tts_config(kr_rate, kr_pitch, kr_volume, en_rate, en_pitch, en_volume)
 
-# -------------------- 1) 대화 기록 먼저 렌더링 --------------------
+# -------------------- 1) 대화 기록 먼저 --------------------
 st.divider()
 st.markdown("### 📜 대화 기록")
-for idx, msg in enumerate(st.session_state.history):
+for idx, msg in enumerate(ss.history):
     with st.chat_message(msg["role"]):
         st.write(msg["content"])
         tts_row(msg["content"], key_prefix=f"hist_{idx}")
 
-# -------------------- 2) 후보(두 답변) 섹션: 기록 '아래' --------------------
-cands = st.session_state.candidates
-if cands:
+# -------------------- 2) 후보(두 답변) - 반드시 기록 '아래' --------------------
+cands = ss.candidates
+if ss.pending_selection and isinstance(cands, dict):
     st.divider()
     st.subheader("🧠 생성된 두 개의 답변")
 
@@ -202,9 +219,10 @@ if cands:
         tts_row(cands.get("kr", ""), key_prefix="cand_kr")
         if st.button("✅ 한국어 답변 선택", key="pick_kr"):
             chosen = cands.get("kr", "")
-            if chosen and st.session_state.last_candidate_idx is not None:
-                st.session_state.history[st.session_state.last_candidate_idx]["content"] = chosen
-            st.session_state.candidates = None
+            if chosen and ss.last_candidate_idx is not None:
+                ss.history[ss.last_candidate_idx]["content"] = chosen
+            ss.pending_selection = False
+            ss.candidates = {}
             st.rerun()
 
     # EN 카드
@@ -214,35 +232,42 @@ if cands:
         tts_row(cands.get("en", ""), key_prefix="cand_en")
         if st.button("✅ English Answer Select", key="pick_en"):
             chosen = cands.get("en", "")
-            if chosen and st.session_state.last_candidate_idx is not None:
-                st.session_state.history[st.session_state.last_candidate_idx]["content"] = chosen
-            st.session_state.candidates = None
+            if chosen and ss.last_candidate_idx is not None:
+                ss.history[ss.last_candidate_idx]["content"] = chosen
+            ss.pending_selection = False
+            ss.candidates = {}
             st.rerun()
 
-# -------------------- 3) 입력창: 항상 '맨 아래' --------------------
+# -------------------- 3) 입력창: 항상 맨 아래 --------------------
 user_query = st.chat_input("궁금한 점을 입력하세요!")
 
 if user_query:
-    # 사용자 메시지 기록
-    st.session_state.history.append({"role": "user", "content": user_query})
+    # 3-1. 사용자 기록
+    ss.history.append({"role": "user", "content": user_query})
 
-    # 후보 생성
+    # 3-2. 후보 생성 + 기본 KR 답변을 즉시 히스토리에 추가
     try:
-        c = generate_two_answers(user_query)
-        st.session_state.candidates = c
-
-        # ✅ 기본값: KR 답변을 히스토리에 즉시 추가
-        st.session_state.history.append({"role": "assistant", "content": c.get("kr", "")})
-        st.session_state.last_candidate_idx = len(st.session_state.history) - 1
-
+        with st.spinner("답변 생성 중..."):
+            c = generate_two_answers(user_query)
+        ss.candidates = c
+        ss.pending_selection = True  # ← 선택 대기 시작
+        # 기본값: KR을 히스토리에 먼저 넣어 흐름 유지
+        ss.history.append({"role": "assistant", "content": c.get("kr", "")})
+        ss.last_candidate_idx = len(ss.history) - 1
+        st.toast("두 개의 답변 후보가 준비되었습니다. 아래에서 선택하세요.", icon="🤖")
     except HTTPStatusError as e:
         code = getattr(e.response, "status_code", None)
         text = getattr(e.response, "text", "")[:500]
         st.error(f"API 오류({code}): {text}")
+        ss.pending_selection = False
+        ss.candidates = {}
     except (ConnectError, ReadTimeout):
         st.error("네트워크 문제로 실패했습니다. 잠시 후 다시 시도해 주세요.")
+        ss.pending_selection = False
+        ss.candidates = {}
     except Exception as e:
         st.error(f"알 수 없는 오류(응답 생성 단계): {e}")
+        ss.pending_selection = False
+        ss.candidates = {}
 
-    # 최신 상태 반영
     st.rerun()
