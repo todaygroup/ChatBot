@@ -23,9 +23,11 @@ st.write(
 
 # -------------------- 세션 상태 --------------------
 if "history" not in st.session_state:
-    st.session_state.history = []       # [{"role": "user|assistant", "content": str}, ...]
+    st.session_state.history = []         # [{"role": "user|assistant", "content": str}, ...]
 if "candidates" not in st.session_state:
-    st.session_state.candidates = None  # {"kr": str, "en": str}
+    st.session_state.candidates = None    # {"kr": str, "en": str}
+if "last_candidate_idx" not in st.session_state:
+    st.session_state.last_candidate_idx = None  # 마지막으로 기록한 후보 답변(히스토리 인덱스)
 
 # -------------------- API 키 로딩 --------------------
 secret_key = st.secrets.get("OPENAI_API_KEY", "")
@@ -79,16 +81,17 @@ with st.sidebar:
     max_tokens = st.slider("Max Output Tokens", 128, 4096, 800, 50)
 
     st.subheader("🔊 음성(TTS) 설정")
-    kr_rate = st.slider("한국어 속도 (rate)", 0.5, 1.5, 1.0, 0.05)
-    kr_pitch = st.slider("한국어 피치 (pitch)", 0.5, 2.0, 1.0, 0.05)
+    kr_rate   = st.slider("한국어 속도 (rate)", 0.5, 1.5, 1.0, 0.05)
+    kr_pitch  = st.slider("한국어 피치 (pitch)", 0.5, 2.0, 1.0, 0.05)
     kr_volume = st.slider("한국어 볼륨 (volume)", 0.0, 1.0, 1.0, 0.05)
-    en_rate = st.slider("영어 속도 (rate)", 0.5, 1.5, 1.0, 0.05)
-    en_pitch = st.slider("영어 피치 (pitch)", 0.5, 2.0, 1.0, 0.05)
+    en_rate   = st.slider("영어 속도 (rate)", 0.5, 1.5, 1.0, 0.05)
+    en_pitch  = st.slider("영어 피치 (pitch)", 0.5, 2.0, 1.0, 0.05)
     en_volume = st.slider("영어 볼륨 (volume)", 0.0, 1.0, 1.0, 0.05)
 
     if st.button("🧹 초기화(히스토리/후보 삭제)"):
         st.session_state.history.clear()
         st.session_state.candidates = None
+        st.session_state.last_candidate_idx = None
         st.success("초기화 완료!")
         st.rerun()
 
@@ -126,15 +129,21 @@ You MUST answer in the following format:
         kr = full.strip()  # 포맷 어긋나면 전체를 KR로
     return {"kr": kr, "en": en}
 
-# -------------------- 공통: Web Speech API 버튼 --------------------
+# -------------------- 공통: Web Speech API 버튼(2열 한 줄) --------------------
 import streamlit.components.v1 as components
 
-def tts_button_html(text: str, lang: str, btn_id: str):
-    """단일 TTS 버튼(아이콘+라벨) HTML/JS 반환."""
+def push_tts_config(kr_rate, kr_pitch, kr_volume, en_rate, en_pitch, en_volume):
+    cfg = {
+        "ko-KR": {"rate": kr_rate, "pitch": kr_pitch, "volume": kr_volume},
+        "en-US": {"rate": en_rate, "pitch": en_pitch, "volume": en_volume},
+    }
+    components.html(f"<script>window.__ST_TTS_CFG__ = {json.dumps(cfg)};</script>", height=0)
+
+def tts_button_html(text: str, lang: str, btn_id: str, label: str):
     safe_text = json.dumps(text)
     return f"""
 <button id="{btn_id}" style="width:100%;cursor:pointer;border-radius:8px;padding:6px 10px;border:1px solid #444;background:#1f2937;color:#e5e7eb;">
-  🔊 { 'Play (KR)' if lang=='ko-KR' else 'Play (EN)' }
+  🔊 {html.escape(label)}
 </button>
 <script>
 (function(){{
@@ -142,13 +151,15 @@ def tts_button_html(text: str, lang: str, btn_id: str):
   if(!btn) return;
   btn.addEventListener("click", function(){{
     try {{
-      const utter = new SpeechSynthesisUtterance({safe_text});
-      utter.lang = "{lang}";
-      // rate/pitch/volume는 전역변수에서 읽도록 커스텀 이벤트로 전달
+      const t = {safe_text};
+      if(!t) return;
+      const utter = new SpeechSynthesisUtterance(t);
       const cfg = window.__ST_TTS_CFG__ || {{}};
-      utter.rate = cfg["{lang}"]?.rate ?? 1.0;
-      utter.pitch = cfg["{lang}"]?.pitch ?? 1.0;
-      utter.volume = cfg["{lang}"]?.volume ?? 1.0;
+      const lang = "{lang}";
+      utter.lang   = lang;
+      utter.rate   = (cfg[lang]?.rate   ?? 1.0);
+      utter.pitch  = (cfg[lang]?.pitch  ?? 1.0);
+      utter.volume = (cfg[lang]?.volume ?? 1.0);
       window.speechSynthesis.cancel();
       window.speechSynthesis.speak(utter);
     }} catch(e) {{
@@ -160,30 +171,14 @@ def tts_button_html(text: str, lang: str, btn_id: str):
 </script>
 """
 
-def push_tts_config(kr_rate, kr_pitch, kr_volume, en_rate, en_pitch, en_volume):
-    """현재 슬라이더 값을 브라우저 전역(window.__ST_TTS_CFG__)에 주입."""
-    cfg = {
-        "ko-KR": {"rate": kr_rate, "pitch": kr_pitch, "volume": kr_volume},
-        "en-US": {"rate": en_rate, "pitch": en_pitch, "volume": en_volume},
-    }
-    components.html(
-        f"""
-<script>
-window.__ST_TTS_CFG__ = {json.dumps(cfg)};
-</script>
-""",
-        height=0,
-    )
-
 def tts_row(text: str, key_prefix: str):
-    """두 개 버튼을 2열 한 줄로 렌더링."""
     c1, c2 = st.columns(2)
     with c1:
-        components.html(tts_button_html(text, "ko-KR", f"{key_prefix}_kr"), height=48)
+        components.html(tts_button_html(text, "ko-KR", f"{key_prefix}_kr", "Play (KR)"), height=48)
     with c2:
-        components.html(tts_button_html(text, "en-US", f"{key_prefix}_en"), height=48)
+        components.html(tts_button_html(text, "en-US", f"{key_prefix}_en", "Play (EN)"), height=48)
 
-# 슬라이더 값을 JS 전역으로 1회 주입(페이지 리렌더마다 최신 반영)
+# 매 렌더마다 최신 TTS 설정 반영
 push_tts_config(kr_rate, kr_pitch, kr_volume, en_rate, en_pitch, en_volume)
 
 # -------------------- 1) 대화 기록 먼저 렌더링 --------------------
@@ -192,10 +187,9 @@ st.markdown("### 📜 대화 기록")
 for idx, msg in enumerate(st.session_state.history):
     with st.chat_message(msg["role"]):
         st.write(msg["content"])
-        # 한 줄(2열) TTS 버튼
         tts_row(msg["content"], key_prefix=f"hist_{idx}")
 
-# -------------------- 2) 후보(두 답변) 섹션: 대화 기록 '아래'에 고정 --------------------
+# -------------------- 2) 후보(두 답변) 섹션: 기록 '아래' --------------------
 cands = st.session_state.candidates
 if cands:
     st.divider()
@@ -205,12 +199,11 @@ if cands:
     with st.container():
         st.markdown("#### 🇰🇷 KR Korean Answer [KR]")
         st.write(cands.get("kr") or "_(생성 결과가 비었습니다)_")
-        # 답변 텍스트에 대한 TTS (2열, 한 줄)
         tts_row(cands.get("kr", ""), key_prefix="cand_kr")
         if st.button("✅ 한국어 답변 선택", key="pick_kr"):
             chosen = cands.get("kr", "")
-            if chosen:
-                st.session_state.history.append({"role": "assistant", "content": chosen})
+            if chosen and st.session_state.last_candidate_idx is not None:
+                st.session_state.history[st.session_state.last_candidate_idx]["content"] = chosen
             st.session_state.candidates = None
             st.rerun()
 
@@ -218,24 +211,30 @@ if cands:
     with st.container():
         st.markdown("#### 🇺🇸 US English Answer [EN]")
         st.write(cands.get("en") or "_(생성 결과가 비었습니다)_")
-        # 답변 텍스트에 대한 TTS (2열, 한 줄)
         tts_row(cands.get("en", ""), key_prefix="cand_en")
         if st.button("✅ English Answer Select", key="pick_en"):
             chosen = cands.get("en", "")
-            if chosen:
-                st.session_state.history.append({"role": "assistant", "content": chosen})
+            if chosen and st.session_state.last_candidate_idx is not None:
+                st.session_state.history[st.session_state.last_candidate_idx]["content"] = chosen
             st.session_state.candidates = None
             st.rerun()
 
-# -------------------- 3) 입력창: 항상 '맨 아래'에 배치 --------------------
+# -------------------- 3) 입력창: 항상 '맨 아래' --------------------
 user_query = st.chat_input("궁금한 점을 입력하세요!")
 
 if user_query:
-    # 히스토리에 사용자 메시지 추가
+    # 사용자 메시지 기록
     st.session_state.history.append({"role": "user", "content": user_query})
-    # 새 후보 생성 후 세션에 저장
+
+    # 후보 생성
     try:
-        st.session_state.candidates = generate_two_answers(user_query)
+        c = generate_two_answers(user_query)
+        st.session_state.candidates = c
+
+        # ✅ 기본값: KR 답변을 히스토리에 즉시 추가
+        st.session_state.history.append({"role": "assistant", "content": c.get("kr", "")})
+        st.session_state.last_candidate_idx = len(st.session_state.history) - 1
+
     except HTTPStatusError as e:
         code = getattr(e.response, "status_code", None)
         text = getattr(e.response, "text", "")[:500]
@@ -244,5 +243,6 @@ if user_query:
         st.error("네트워크 문제로 실패했습니다. 잠시 후 다시 시도해 주세요.")
     except Exception as e:
         st.error(f"알 수 없는 오류(응답 생성 단계): {e}")
-    # 업데이트 반영
+
+    # 최신 상태 반영
     st.rerun()
